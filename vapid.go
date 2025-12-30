@@ -8,10 +8,26 @@ import (
 	"math/big"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
 )
+
+// Cache for VAPID authorization headers (keyed by privateKey + publicKey + audience)
+var vapidHeaderCache sync.Map
+
+// Cache for parsed private keys (keyed by vapidPrivateKey)
+var privateKeyCache sync.Map
+
+// vapidCacheEntry stores cached VAPID header with expiration
+type vapidCacheEntry struct {
+	header     string
+	expiration time.Time
+}
+
+// cacheMargin is how long before expiration we consider cache invalid (safety margin)
+const cacheMargin = 30 * time.Minute
 
 // GenerateVAPIDKeys will create a private and public VAPID key pair
 func GenerateVAPIDKeys() (privateKey, publicKey string, err error) {
@@ -58,7 +74,8 @@ func generateVAPIDHeaderKeys(privateKey []byte) *ecdsa.PrivateKey {
 	}
 }
 
-// getVAPIDAuthorizationHeader
+// getVAPIDAuthorizationHeader returns a cached VAPID authorization header if available,
+// otherwise generates a new one and caches it.
 func getVAPIDAuthorizationHeader(
 	endpoint,
 	subscriber,
@@ -66,10 +83,26 @@ func getVAPIDAuthorizationHeader(
 	vapidPrivateKey string,
 	expiration time.Time,
 ) (string, error) {
-	// Create the JWT token
+	// Parse endpoint to get audience
 	subURL, err := url.Parse(endpoint)
 	if err != nil {
 		return "", err
+	}
+
+	audience := subURL.Scheme + "://" + subURL.Host
+
+	// Create cache key: privateKey + publicKey + audience
+	cacheKey := vapidPrivateKey + "|" + vapidPublicKey + "|" + audience
+
+	// Check cache for existing valid header
+	if cached, ok := vapidHeaderCache.Load(cacheKey); ok {
+		entry := cached.(vapidCacheEntry)
+		// Return cached header if still valid (with safety margin)
+		if time.Now().Add(cacheMargin).Before(entry.expiration) {
+			return entry.header, nil
+		}
+		// Cache expired, delete it
+		vapidHeaderCache.Delete(cacheKey)
 	}
 
 	// Unless subscriber is an HTTPS URL, assume an e-mail address
@@ -78,18 +111,16 @@ func getVAPIDAuthorizationHeader(
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodES256, jwt.MapClaims{
-		"aud": subURL.Scheme + "://" + subURL.Host,
+		"aud": audience,
 		"exp": expiration.Unix(),
 		"sub": subscriber,
 	})
 
-	// Decode the VAPID private key
-	decodedVapidPrivateKey, err := decodeVapidKey(vapidPrivateKey)
+	// Get or create cached private key
+	privKey, err := getCachedPrivateKey(vapidPrivateKey)
 	if err != nil {
 		return "", err
 	}
-
-	privKey := generateVAPIDHeaderKeys(decodedVapidPrivateKey)
 
 	// Sign token with private key
 	jwtString, err := token.SignedString(privKey)
@@ -103,7 +134,36 @@ func getVAPIDAuthorizationHeader(
 		return "", err
 	}
 
-	return "vapid t=" + jwtString + ", k=" + base64.RawURLEncoding.EncodeToString(pubKey), nil
+	header := "vapid t=" + jwtString + ", k=" + base64.RawURLEncoding.EncodeToString(pubKey)
+
+	// Cache the header
+	vapidHeaderCache.Store(cacheKey, vapidCacheEntry{
+		header:     header,
+		expiration: expiration,
+	})
+
+	return header, nil
+}
+
+// getCachedPrivateKey returns a cached parsed private key or parses and caches a new one
+func getCachedPrivateKey(vapidPrivateKey string) (*ecdsa.PrivateKey, error) {
+	// Check cache
+	if cached, ok := privateKeyCache.Load(vapidPrivateKey); ok {
+		return cached.(*ecdsa.PrivateKey), nil
+	}
+
+	// Decode and parse the private key
+	decodedVapidPrivateKey, err := decodeVapidKey(vapidPrivateKey)
+	if err != nil {
+		return nil, err
+	}
+
+	privKey := generateVAPIDHeaderKeys(decodedVapidPrivateKey)
+
+	// Cache the parsed key
+	privateKeyCache.Store(vapidPrivateKey, privKey)
+
+	return privKey, nil
 }
 
 // Need to decode the vapid private key in multiple base64 formats
