@@ -9,10 +9,22 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
 )
+
+// Cache stats for monitoring (optional)
+var (
+	vapidCacheHits   uint64
+	vapidCacheMisses uint64
+)
+
+// GetVAPIDCacheStats returns cache hit/miss stats for monitoring
+func GetVAPIDCacheStats() (hits, misses uint64) {
+	return atomic.LoadUint64(&vapidCacheHits), atomic.LoadUint64(&vapidCacheMisses)
+}
 
 // Cache for VAPID authorization headers (keyed by privateKey + publicKey + audience)
 var vapidHeaderCache sync.Map
@@ -99,11 +111,14 @@ func getVAPIDAuthorizationHeader(
 		entry := cached.(vapidCacheEntry)
 		// Return cached header if still valid (with safety margin)
 		if time.Now().Add(cacheMargin).Before(entry.expiration) {
+			// atomic.AddUint64(&vapidCacheHits, 1)
 			return entry.header, nil
 		}
 		// Cache expired, delete it
 		vapidHeaderCache.Delete(cacheKey)
 	}
+
+	// atomic.AddUint64(&vapidCacheMisses, 1)
 
 	// Unless subscriber is an HTTPS URL, assume an e-mail address
 	if !strings.HasPrefix(subscriber, "https:") {
